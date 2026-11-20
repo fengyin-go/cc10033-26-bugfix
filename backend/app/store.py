@@ -6,11 +6,12 @@ FailureRecovery 管理断点恢复；SnapshotEngine 提供版本快照能力。
 from __future__ import annotations
 
 import hashlib
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from app.seed import SEED_ROWS
+from app.seed import SEED_CREDENTIALS, SEED_ROWS, SEED_VERDICTS
 
 
 class DataChannel:
@@ -316,6 +317,235 @@ class ArtifactRegistry:
         return {"total": len(self._artifacts), "by_type": by_type, "by_module": by_module}
 
 
+class VerdictLedger:
+    """判定台账：同一范围只保留一项当前有效判定，并保留历史判定与更正留痕。
+
+    每次 record 都追加一条不可变判定；若该范围已有有效判定，旧判定被标记为失效
+    （effective=False, superseded_by=新判定），但记录本身、比较依据、是否曾作为
+    交付依据以及被哪条新判定更正都能回溯。
+    """
+
+    def __init__(self) -> None:
+        self._verdicts: list[dict[str, Any]] = []
+        self._credentials: dict[str, dict[str, Any]] = {}
+        self._seq = 0
+
+    def _next_id(self, prefix: str) -> str:
+        self._seq += 1
+        return f"{prefix}-{self._seq:04d}"
+
+    def record(
+        self,
+        *,
+        scope: str,
+        subject: str,
+        verdict: str,
+        basis: dict[str, Any],
+        source: str,
+        entry_id: int | None = None,
+        subject_kind: str = "",
+        used_for_delivery: bool | None = None,
+        delivery_ref: str | None = None,
+        legacy: bool = False,
+        correction_note: str = "",
+    ) -> dict[str, Any]:
+        now = datetime.now(timezone.utc).isoformat()
+        verdict_id = self._next_id("VD")
+        prior = self.effective(scope)
+        # 未显式声明时沿用前一条判定的交付留痕，保证更正后仍能核对交付依据。
+        if used_for_delivery is None:
+            used_for_delivery = bool(prior.get("used_for_delivery")) if prior else False
+        if delivery_ref is None:
+            delivery_ref = str(prior.get("delivery_ref", "")) if prior else ""
+        record: dict[str, Any] = {
+            "verdict_id": verdict_id,
+            "scope": scope,
+            "subject": subject,
+            "subject_kind": subject_kind,
+            "verdict": verdict,
+            "effective": True,
+            "legacy_rule": legacy,
+            "basis": dict(basis),
+            "source": source,
+            "entry_id": entry_id,
+            "used_for_delivery": bool(used_for_delivery),
+            "delivery_ref": delivery_ref,
+            "created_at": now,
+            "supersedes": None,
+            "superseded_by": None,
+            "superseded_at": None,
+            "correction_of": None,
+            "prior_verdict": None,
+            "correction_note": correction_note,
+        }
+        if prior is not None:
+            record["supersedes"] = prior["verdict_id"]
+            record["correction_of"] = prior["verdict_id"]
+            record["prior_verdict"] = {
+                "verdict_id": prior["verdict_id"],
+                "verdict": prior["verdict"],
+                "rule": prior.get("basis", {}).get("rule", ""),
+                "actual_key_fields": prior.get("basis", {}).get("actual_key_fields", []),
+                "standard_key_fields": prior.get("basis", {}).get("standard_key_fields", []),
+                "compared_keys": prior.get("basis", {}).get("compared_keys", []),
+                "legacy_compared_fields": prior.get("basis", {}).get("legacy_compared_fields", []),
+                "used_for_delivery": prior.get("used_for_delivery", False),
+                "delivery_ref": prior.get("delivery_ref", ""),
+                "created_at": prior.get("created_at"),
+            }
+            if not record["correction_note"]:
+                record["correction_note"] = (
+                    f"更正判定 {prior['verdict']} → {verdict}："
+                    f"旧规则「{prior.get('basis', {}).get('rule', '')}」，"
+                    f"新规则「{basis.get('rule', '')}」"
+                )
+            prior["effective"] = False
+            prior["superseded_by"] = verdict_id
+            prior["superseded_at"] = now
+            # 旧判定签发的模型凭证随判定失效一并撤销
+            self.revoke_for_scope(scope, verdict_id, f"被判定 {verdict_id} 取代")
+
+        # 防御性收口：同一范围不允许存在第二条有效判定
+        for existing in self._verdicts:
+            if existing["scope"] == scope and existing["effective"]:
+                existing["effective"] = False
+                existing["superseded_by"] = verdict_id
+                existing["superseded_at"] = now
+
+        self._verdicts.append(record)
+        return record
+
+    def load_seed(self, record: dict[str, Any]) -> None:
+        """载入历史判定（可能曾作为交付依据），保留原始依据和判定编号。"""
+        seeded = dict(record)
+        seeded.setdefault("effective", True)
+        seeded.setdefault("legacy_rule", True)
+        seeded.setdefault("used_for_delivery", False)
+        seeded.setdefault("delivery_ref", "")
+        seeded.setdefault("supersedes", None)
+        seeded.setdefault("superseded_by", None)
+        seeded.setdefault("superseded_at", None)
+        seeded.setdefault("correction_of", None)
+        seeded.setdefault("prior_verdict", None)
+        seeded.setdefault("correction_note", "")
+        seeded.setdefault("basis", {})
+        seeded.setdefault("scope", "")
+        seeded.setdefault("subject", "")
+        seeded.setdefault("subject_kind", "")
+        seeded.setdefault("source", "seed")
+        seeded.setdefault("entry_id", None)
+        self._verdicts.append(seeded)
+        match = re.match(r"^[A-Z]+-(\d+)$", str(seeded.get("verdict_id", "")))
+        if match:
+            self._seq = max(self._seq, int(match.group(1)))
+
+    def load_seed_credential(self, credential: dict[str, Any]) -> None:
+        seeded = dict(credential)
+        seeded.setdefault("status", "有效")
+        seeded.setdefault("partition", "")
+        seeded.setdefault("legacy_rule", True)
+        seeded.setdefault("used_for_delivery", False)
+        seeded.setdefault("delivery_ref", "")
+        seeded.setdefault("revoked_by", None)
+        seeded.setdefault("revoked_reason", "")
+        seeded.setdefault("revoked_at", None)
+        seeded.setdefault("entry_id", None)
+        self._credentials[seeded["credential_id"]] = seeded
+        match = re.match(r"^[A-Z]+-(\d+)$", str(seeded.get("credential_id", "")))
+        if match:
+            self._seq = max(self._seq, int(match.group(1)))
+
+    def effective(self, scope: str) -> dict[str, Any] | None:
+        for record in reversed(self._verdicts):
+            if record["scope"] == scope and record["effective"]:
+                return record
+        return None
+
+    def history(self, scope: str) -> list[dict[str, Any]]:
+        return [record for record in self._verdicts if record["scope"] == scope]
+
+    def all_verdicts(self) -> list[dict[str, Any]]:
+        return [dict(record) for record in self._verdicts]
+
+    def issue_credential(
+        self,
+        *,
+        target_model: str,
+        scope: str,
+        rule_name: str,
+        verdict_record: dict[str, Any],
+        partition: str = "",
+        entry_id: int | None = None,
+        legacy: bool = False,
+        used_for_delivery: bool = False,
+        delivery_ref: str = "",
+    ) -> dict[str, Any] | None:
+        """只有「通过」且实际主键全部定位的判定才能签发模型凭证。"""
+        if verdict_record.get("verdict") != "通过":
+            return None
+        if not verdict_record.get("basis", {}).get("all_keys_located", False):
+            return None
+        now = datetime.now(timezone.utc).isoformat()
+        credential_id = self._next_id("CRED")
+        for existing in self._credentials.values():
+            if (
+                existing["target_model"] == target_model
+                and existing["scope"] == scope
+                and existing["rule_name"] == rule_name
+                and existing["status"] == "有效"
+            ):
+                existing["status"] = "已撤销"
+                existing["revoked_by"] = credential_id
+                existing["revoked_reason"] = f"被新凭证 {credential_id} 取代"
+                existing["revoked_at"] = now
+        credential = {
+            "credential_id": credential_id,
+            "target_model": target_model,
+            "scope": scope,
+            "rule_name": rule_name,
+            "partition": partition,
+            "verdict_id": verdict_record["verdict_id"],
+            "verdict": verdict_record["verdict"],
+            "status": "有效",
+            "legacy_rule": legacy,
+            "used_for_delivery": bool(used_for_delivery),
+            "delivery_ref": delivery_ref,
+            "issued_at": now,
+            "revoked_by": None,
+            "revoked_reason": "",
+            "revoked_at": None,
+            "entry_id": entry_id,
+        }
+        self._credentials[credential_id] = credential
+        return dict(credential)
+
+    def revoke_for_scope(self, scope: str, new_verdict_id: str, reason: str) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        for credential in self._credentials.values():
+            if credential["scope"] == scope and credential["status"] == "有效":
+                credential["status"] = "已撤销"
+                credential["revoked_by"] = new_verdict_id
+                credential["revoked_reason"] = reason
+                credential["revoked_at"] = now
+
+    def credentials(self, target_model: str | None = None) -> list[dict[str, Any]]:
+        values = list(self._credentials.values())
+        if target_model is not None:
+            values = [c for c in values if c["target_model"] == target_model]
+        return [dict(value) for value in values]
+
+    def effective_credential(self, target_model: str, scope: str, rule_name: str) -> dict[str, Any] | None:
+        for credential in reversed(list(self._credentials.values())):
+            if (
+                credential["target_model"] == target_model
+                and credential["scope"] == scope
+                and credential["rule_name"] == rule_name
+                and credential["status"] == "有效"
+            ):
+                return dict(credential)
+        return None
+
+
 class Store:
     def __init__(self) -> None:
         self._tables: dict[str, list[dict[str, Any]]] = {
@@ -325,6 +555,11 @@ class Store:
         self.recovery = FailureRecovery()
         self.snapshot = SnapshotEngine()
         self.artifacts = ArtifactRegistry()
+        self.verdicts = VerdictLedger()
+        for verdict in SEED_VERDICTS:
+            self.verdicts.load_seed(verdict)
+        for credential in SEED_CREDENTIALS:
+            self.verdicts.load_seed_credential(credential)
 
     def module_names(self) -> list[str]:
         return sorted(self._tables)

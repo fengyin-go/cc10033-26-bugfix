@@ -59,3 +59,85 @@ export async function loadOverview(): Promise<OverviewResult> {
   if (!response.ok) throw new Error('运营概览读取失败')
   return await response.json()
 }
+
+export type KeyComparison = {
+  dim_code: string
+  dim_name: string
+  standard_name: string
+  standard_version: string
+  actual_key_fields: string[]
+  standard_key_fields: string[]
+  compared_keys: { position: number; actual: string; standard: string; match: boolean }[]
+  same_key_different_name: boolean
+  same_name_different_key: boolean
+  verdict: string
+  verdict_id: string
+  correction_of: string | null
+  prior_verdict: Record<string, unknown> | null
+  correction_note: string
+  used_for_delivery: boolean
+  delivery_ref: string
+}
+
+export type VerdictRecord = {
+  verdict_id: string
+  scope: string
+  subject: string
+  verdict: string
+  effective: boolean
+  supersedes: string | null
+  superseded_by: string | null
+  correction_of: string | null
+  correction_note: string
+  legacy_rule: boolean
+  used_for_delivery: boolean
+  delivery_ref: string
+  basis: Record<string, unknown>
+  prior_verdict: Record<string, unknown> | null
+  created_at: string
+}
+
+export type Credential = {
+  credential_id: string
+  target_model: string
+  scope: string
+  rule_name: string
+  partition: string
+  verdict_id: string
+  status: string
+  legacy_rule: boolean
+  used_for_delivery: boolean
+  delivery_ref: string
+  revoked_by: string | null
+  revoked_reason: string
+}
+
+export type ModelKeyAudit = {
+  target_model: string
+  actual_key_fields: string[]
+  standard_key_fields: string[]
+  compared_key_labels: string[]
+  compared_keys: { dim_code: string; position: number; actual: string; standard: string; match: boolean }[]
+  unresolved: { dim_code: string; dim_name: string; reason: string; actual_key_fields: string[]; standard_key_fields: string[] }[]
+  mismatched_keys: { dim_code: string; actual: string; standard: string; position: number }[]
+  partitions: { partition: string; passed: boolean; verdict: string; mismatched_keys: unknown[]; unresolved: unknown[] }[]
+  current_verdict: string
+  verdict: VerdictRecord | null
+  history: VerdictRecord[]
+  credentials: Credential[]
+  rules: { entry_id: number; rule_name: string; validation_type: string; status: string }[]
+}
+
+export async function loadConformAudit(): Promise<{ key_comparisons: KeyComparison[]; standards: Record<string, unknown>[]; verdict_history: VerdictRecord[] }> {
+  const response = await request('/api/conform_dim/audit')
+  if (!response.ok) throw new Error('一致性维度键比对读取失败')
+  return (await response.json()).view
+}
+
+export async function loadModelAudit(targetModel?: string): Promise<{ models: ModelKeyAudit[]; credentials: Credential[] }> {
+  const query = targetModel ? `?target_model=${encodeURIComponent(targetModel)}` : ''
+  const response = await request(`/api/model_validate/audit${query}`)
+  if (!response.ok) throw new Error('模型校验键比对读取失败')
+  const payload = await response.json()
+  return { models: payload.audit.models, credentials: payload.credentials }
+}

@@ -8,11 +8,15 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.audit import reconcile_all
 from app.config import settings
 from app.routers import ROUTERS
 from app.store import store
 
 app = FastAPI(title="维度建模开发中心", version="1.0.0")
+
+# 历史误判在启动时按新规则重算：旧判定保留并标记更正，同范围只留一项有效判定。
+RECONCILIATION = reconcile_all(store)
 
 app.add_middleware(
     CORSMiddleware,

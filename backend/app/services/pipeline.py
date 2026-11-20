@@ -417,47 +417,103 @@ def conform_dim_constrain(
     conform_name: str,
     required_dim_keys: list[str],
     store: Any,
+    standard_version: str | None = None,
 ) -> dict[str, Any]:
     """将一致性维度标准与维度定义做关联约束校验。
 
-    检查所有 dim_definition 记录是否符合一致性维度标准。
+    比对依据是维度的实际主键字段和标准的键字段（按标准版本），
+    展示名称不再参与键兼容判断。找不到实际主键的维度单列为待验证。
     """
+    from app.key_compare import (
+        compare_dim_to_standard,
+        record_conform_verdict,
+        standard_for_dim,
+    )
+
     dim_table = store.rows("dim_definition")
     conform_table = store.rows("conform_dim")
 
+    candidates = [
+        c for c in conform_table
+        if str(c.get("标准名称", "")) == conform_name
+    ]
     conform_entry = None
-    for c in conform_table:
-        if str(c.get("标准名称", "")) == conform_name:
-            conform_entry = c
-            break
+    if standard_version:
+        for candidate in candidates:
+            if str(candidate.get("版本号", "")) == standard_version:
+                conform_entry = candidate
+                break
+    elif candidates:
+        conform_entry = max(
+            candidates,
+            key=lambda c: tuple(int(p) for p in str(c.get("版本号", "0")).lstrip("vV").split(".")
+                                if p.isdigit()) or (0,),
+        )
 
     if not conform_entry:
         return {"error": f"未找到一致性维度 {conform_name}"}
 
+    by_code = {str(dim.get("维度编码", "")): dim for dim in dim_table}
     violations: list[dict[str, Any]] = []
     passed: list[str] = []
+    pending: list[dict[str, Any]] = []
+    comparisons: list[dict[str, Any]] = []
 
-    for dim in dim_table:
-        dim_key = str(dim.get("维度编码", ""))
-        if dim_key in required_dim_keys:
-            dim_name = str(dim.get("维度名称", ""))
-            standard_key = str(conform_entry.get("标准键值", ""))
-            if dim_name and standard_key and dim_name != standard_key:
-                violations.append({
-                    "dim_key": dim_key,
-                    "dim_name": dim_name,
-                    "expected": standard_key,
-                    "reason": f"维度名称与一致性标准 {conform_name} 不一致",
-                })
-            else:
-                passed.append(dim_key)
+    for dim_key in required_dim_keys:
+        dim = by_code.get(dim_key)
+        if dim is None:
+            pending.append({
+                "dim_key": dim_key,
+                "reason": "维度定义不存在，无法定位实际主键字段",
+            })
+            continue
+
+        # 显式指定的标准优先；主题不匹配时仍以指定标准为准，保证可追溯。
+        standard = standard_for_dim(dim, [conform_entry]) or conform_entry
+
+        comparison = compare_dim_to_standard(dim, standard)
+        comparisons.append(comparison)
+        record_conform_verdict(store, dim, standard, comparison, source="conform_dim_constrain")
+
+        if not comparison["keys_located"]:
+            pending.append({
+                "dim_key": dim_key,
+                "dim_name": comparison["dim_name"],
+                "reason": "实际主键字段或标准键字段为空，无法定位参与比较的键",
+                "actual_key_fields": comparison["actual_key_fields"],
+                "standard_key_fields": comparison["standard_key_fields"],
+            })
+        elif comparison["matched"]:
+            passed.append(dim_key)
+        else:
+            violations.append({
+                "dim_key": dim_key,
+                "dim_name": comparison["dim_name"],
+                "expected": comparison["standard_key_value"],
+                "expected_key_fields": comparison["standard_key_fields"],
+                "actual_key_fields": comparison["actual_key_fields"],
+                "compared_keys": comparison["compared_keys"],
+                "standard_version": comparison["standard_version"],
+                "reason": (
+                    f"实际主键 {'/'.join(comparison['actual_key_fields']) or '未定位'} "
+                    f"与标准 {conform_name} {comparison['standard_version']} 键字段 "
+                    f"{'/'.join(comparison['standard_key_fields'])} 不一致"
+                ),
+            })
 
     return {
         "conform_name": conform_name,
+        "standard_version": str(conform_entry.get("版本号", "")),
+        "standard_key_fields": comparisons[0]["standard_key_fields"] if comparisons else [],
         "total_checked": len(required_dim_keys),
         "passed": len(passed),
+        "passed_dims": passed,
         "violations": len(violations),
         "violation_details": violations,
+        "pending": len(pending),
+        "pending_details": pending,
+        "comparisons": comparisons,
+        "rule": "实际主键字段 vs 标准键字段（按标准版本）",
     }
 
 

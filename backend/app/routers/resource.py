@@ -10,6 +10,7 @@ from fastapi.responses import StreamingResponse
 
 from app.schemas import ActionPayload, ActionResult, EntryPayload, PageResult
 from app.services import service_for
+from app.store import store as data_store
 
 router = APIRouter(prefix="/api", tags=["业务资源"])
 
@@ -19,6 +20,49 @@ def require_service(module: str):
     if service is None:
         raise HTTPException(status_code=404, detail=f"未知业务模块：{module}")
     return service
+
+
+@router.get("/conform_dim/audit", response_model=dict)
+def conform_dim_audit() -> dict[str, Any]:
+    """一致性标准列表的键字段比对结果与判定沿革。"""
+    service = require_service("conform_dim")
+    return {
+        "ok": True,
+        "view": service.consistency_view(),
+        "verdicts": [
+            record for record in data_store.verdicts.all_verdicts()
+            if record.get("subject_kind") == "conform_dim"
+        ],
+    }
+
+
+@router.get("/model_validate/audit", response_model=dict)
+def model_validate_audit(target_model: str | None = Query(default=None)) -> dict[str, Any]:
+    """模型校验入口：实际主键字段、分区结论、当前判定与凭证。"""
+    from app.audit import model_audit
+
+    return {
+        "ok": True,
+        "audit": model_audit(data_store, target_model),
+        "credentials": data_store.verdicts.credentials(target_model),
+    }
+
+
+@router.get("/{module}/verdicts", response_model=dict)
+def module_verdicts(module: str, scope: str | None = Query(default=None)) -> dict[str, Any]:
+    """判定台账：同范围的有效判定、历史判定与更正留痕。"""
+    require_service(module)
+    verdicts = [
+        record for record in data_store.verdicts.all_verdicts()
+        if record.get("subject_kind") == module or record.get("scope", "").startswith(f"{module}|")
+    ]
+    if scope:
+        verdicts = [record for record in verdicts if record.get("scope") == scope]
+    return {
+        "ok": True,
+        "current": [record for record in verdicts if record.get("effective")],
+        "history": verdicts,
+    }
 
 
 @router.get("/{module}", response_model=PageResult[dict])

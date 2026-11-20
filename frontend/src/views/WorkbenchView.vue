@@ -90,6 +90,8 @@
       <span>共 {{ total }} 条{{ meta.name }}记录</span>
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
     </footer>
+
+    <KeyAuditPanel v-if="hasKeyAudit" :mode="meta.key" />
   </section>
 </template>
 
@@ -104,9 +106,11 @@ import {
   runAction as applyAction,
 } from '@/api/backend-service'
 import type { EntryRow } from '@/data/types'
+import KeyAuditPanel from '@/views/KeyAuditPanel.vue'
 
 const props = defineProps<{ moduleKey: string }>()
 const meta = moduleMeta(props.moduleKey)
+const hasKeyAudit = computed(() => ['conform_dim', 'model_validate'].includes(meta.key))
 const rows = ref<EntryRow[]>([])
 const total = ref(0)
 const errorMessage = ref('')
